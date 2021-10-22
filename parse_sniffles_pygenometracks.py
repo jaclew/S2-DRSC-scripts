@@ -349,7 +349,7 @@ if 0 and 'dump gene list':
         nf.write('\n'.join(list(genes_DUPDEL)))
 ###/
         
-### MS 20210601: Find reads to plot path
+### Find reads to plot path
 ## Import read lengths
 read_lens = {}
 for read,seq in importReadSeqsFasta('longreads.fa').items():
@@ -386,22 +386,30 @@ for read,SVtypes_idxs in read_SVs_byType.items():
 ##/
 ### INFO
 if 0:
-    def output_pygenometracks(output_name,read_SVs):
-        output_dir_PRE = 'read_paintings/'+output_name
-        output_dir = output_dir_PRE+'/'+'arcs'
+    def output_pygenometracks(output_name,read_SVs,output_dir = 'read_paintings/'):
+        output_dir_PRE = output_dir+output_name
+        output_dir2 = output_dir_PRE+'/'+'arcs'
         mkdir(output_dir_PRE)
-        mkdir(output_dir)
+        mkdir(output_dir2)
         
-        rsqELACP_plotClassis = {'BND','INS','DUP','DEL','INV','INVDEL','INVDUP'}
+        # Check if input is not a dict of SV_idx->SV
+        read_SVs_tmp = {}
+        if not type(read_SVs) == dict:
+            for SV_idx in read_SVs:
+                read_SVs_tmp[SV_idx] = SV_idx_map[SV_idx]
+        read_SVs = read_SVs_tmp
+        #/
+        
+        rsqELACP_plotClassis = {'BND','INS','DUP','DEL','INV','INVDEL','INVDUP','INVINVDUP'}
         nf_handles = {}
         for classi in rsqELACP_plotClassis:
-            nf_handles[classi] = {'sameChrom':open(output_dir+'/'+classi+'.sameChrom.arcs','w'),
-                                  'diffChrom':open(output_dir+'/'+classi+'.diffChrom.arcs','w')}
+            nf_handles[classi] = {'sameChrom':open(output_dir2+'/'+classi+'.sameChrom.arcs','w'),
+                                  'diffChrom':open(output_dir2+'/'+classi+'.diffChrom.arcs','w')}
             
         for SV_idx,SV in read_SVs.items():
             #if SV['type'] != 'BND' and SV['len'] < 5000: continue
             
-            nf_classi = nf_handles[SV['type']] #assign NF handle
+            nf_classi = nf_handles[SV['type'].replace('/','')] #assign NF handle
             
             # write for BNDs
             if 'rname2' in SV:
@@ -457,5 +465,125 @@ if 0:
                         if read in SV['reads']():
                             print(loc,read,read_len,SV['rname'],SV['rcoords'],SV['len'],SV['type'],len(SV['reads']()))
     ##/
+    
+    ### Find long/TRA SVs from vcf generated from filtered BAM-file (removal of alignment as entry and in SA tag)
+    ## info-pre: Check number of long/TRA SVs
+    ## (my idea is to make a check for TRA/big-SV events with long anchor alignments and verify with a long read in the region that they are mis-representing)
+    SV_convert_to_BND = 500000 #convert SV to BND if above this size
+    INFO_largeRearr_rnames_counts = {}
+    largeRearr_SVs = [] # SV_idxs
+    largeRearr_qnames_data = {} # qname -> SV_idx -> coordinates to scan for alignment
+    for SV_idx,SV in SV_idx_map.items():
+        rname = SV['rname']
+        rname2 = None
+        if not rname in chroms: continue
+        rcoords = SV['rcoords']
+        rcoord1 = None
+        rcoord2 = None
+        if SV['type'] == 'BND':
+            rcoord1 = rcoords[0]
+            rname2 = SV['rname2']
+            if not rname2 in chroms: continue
+            rcoord2 = SV['rcoord2']
+        elif SV['len'] > SV_convert_to_BND:
+            rcoord1 = rcoords[0]
+            rcoord2 = rcoords[-1]
+            rname2 = rname
+        
+        # Skip if this SV was not a TRA or long SV
+        if not rname2: continue
+        #/
+        
+        # Compile stat
+        ID = '||'.join(sorted([rname,rname2]))
+        init(INFO_largeRearr_rnames_counts,ID,0)
+        INFO_largeRearr_rnames_counts[ID] += 1
+        #/
+        
+        # Save
+        for read in SV['reads']():
+            init(largeRearr_qnames_data,read,{})
+            largeRearr_qnames_data[read][SV_idx] = {'rname1':rname,'rcoord1':rcoord1,'rname2':rname2,'rcoord2':rcoord2,
+                                                      'alns1':[],'alns2':[]}
+        
+        largeRearr_SVs.append(SV_idx)
+        #/
+    ##/
+    
+    # Dump reads to bam for IGV
+    import pysam
+    def dumpReadsFromBam(bam_source,bam_nf,qnames=None,repma_frac_CO=0,readLen_CO=0):
+        bam_fo = pysam.AlignmentFile(bam_source,'rb')
+        bam_nf = pysam.AlignmentFile(bam_nf,'wb',template=bam_fo)
+        for entry in bam_fo:
+            qname = entry.qname
+            if qnames == None or qname in qnames:
+                readlen = parseReadLenFromCIGAR(entry.cigar)
+                if readlen < readLen_CO: continue
+                entry.set_tag('RL',readlen)
+                
+                # quickly scan repMa
+                if repma_frac_CO:
+                    try:
+                        rname = entry.reference_name
+                        rcoords = [entry.reference_start,entry.reference_end]
+                    except:
+                        print('skipping',entry.reference_name,entry.reference_start,entry.reference_end)
+                        continue
+                    ovlps = rangeOverlaps_lookup(rcoords,masking_idx_map_ROMD,100,map_lookup_key=rname)
+                    rangees = [ [rcoords[0],'base',rcoords[-1]] ]
+                    for oS,idx,oE in ovlps:
+                        rangees.append([oS,'masked',oE])
+                    ovlps2 = computeOvlpRanges_wIdxs(rangees)
+                    base_numBP = 0
+                    mask_numBP = 0
+                    for rangee in ovlps2:
+                        if not 'base' in rangee[1]: continue
+                        base_numBP += rangee[-1]-rangee[0]
+                        if 'masked' in rangee[1]:
+                            mask_numBP += rangee[-1]-rangee[0]
+                    maskCovFrac = mask_numBP / base_numBP
+                    if maskCovFrac >= repma_frac_CO:
+                        continue #skip if repeatmasked too much
+                #/
+                    
+                if type(qnames) == dict and qnames[qname]:
+                    if type(qnames[qname]) == int:
+                        entry.set_tag('RN',qnames[qname])
+                    else:
+                        entry.set_tag('RN','||'.join(list(map(str,sorted(qnames[qname])))))
+                bam_nf.write(entry)
+        bam_fo.close()
+        bam_nf.close()
+        
+    if 0 and 'dump':
+        qnames_investigate = {} # qname -> SV_idxs
+        SVs_investigate = set()
+        read_len_thresh = 100000
+        #for SV_idx,data in SV_idxs_investigate.items():
+        #    for entry in data:
+        #        qnames_investigate.add(entry[0])
+        for SV_idx in largeRearr_SVs:
+            SV = SV_idx_map[SV_idx]
+            for read in SV['reads']():
+                if read in read_lens and read_lens[read] >= read_len_thresh:
+                    init(qnames_investigate,read,{})
+                    qnames_investigate[read][SV_idx] = SV
+                    SVs_investigate.add(SV_idx)
+        
+        if 0 and 'parse selected reads from bam':
+            bam_new_name = 'select1_filt2000alnCutoff.bam'
+            filt_bam_name = 'filt2000alnCutoff.bam'
+            dumpReadsFromBam(filt_bam_name,bam_new_name,
+                             qnames = set(qnames_investigate))
+    
+        if 0 and 'dump pygenometracks':
+            for qname in qnames_investigate:
+                out_dir = 'alnFilt2000_paints/'
+                output_pygenometracks(qname,read_SVs[qname],output_dir=out_dir)
+        
+    #/
+    ##/
+    ###/
 ###/
 ###/

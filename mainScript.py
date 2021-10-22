@@ -4992,6 +4992,155 @@ if 0 and 'dump GFA?':
 ##/IDE
 ###/VGSEGS
 
+### Find reads mapping to mito
+if 0:
+    # Grab involved rsqElinks
+    mito_rsqElinks = []
+    for rsqElink_idx,rsqElink in rsqElinks_idx_map.items():
+        if rsqElink['isUsed'] == False: continue
+        hasMito = False
+        for intstr in ('1','2',):
+            if rsqElink['rname'+intstr] == 'mitochondrion_genome':
+                hasMito = True
+    
+        if hasMito:
+            mito_rsqElinks.append(rsqElink)
+    #/
+    # Get qnames involved
+    mito_qnames = set()
+    for rsqElink in mito_rsqElinks:
+        mito_qnames.update(rsqElink['reads']())
+    #/
+    # Cluster reads based on span across mito
+    loci_qnames_data = {} #loci -> qname -> oQnames + genes
+    margin_add1 = 15000 # margin for reads mapping around mito rsqEs on call-read
+    margin_add2 = 10000 # margin for reads at either anchor
+    for qname in mito_qnames:
+        # Find mito rsqEs
+        mito_rsqEs = []
+        for rsqE in qname_rsqRanges[qname]:
+            if rsqE['rname'] == 'mitochondrion_genome':
+                mito_rsqEs.append(rsqE)
+        mito_rsqEs.sort(key=lambda x: x['qcoords'][0])
+        #/
+        # Find first rsqE before mito
+        pre_mito = None
+        prev_rsqE = None
+        for rsqE in sorted(qname_rsqRanges[qname],key=lambda x: x['qcoords'][0]):
+            if rsqE['masked_covFrac'] >= 0.7: continue #skip if masked
+            if rsqE['len'] < 1000: continue
+            if rsqE['rname'] == 'mitochondrion_genome' and pre_mito == None and (prev_rsqE == None or prev_rsqE['rname'] != 'mitochondrion_genome'):
+                pre_mito = prev_rsqE
+            prev_rsqE=rsqE
+        #/
+        # Find rsqE after mito
+        post_mito = None
+        prev_rsqE = None
+        for rsqE in sorted(qname_rsqRanges[qname],key=lambda x: x['qcoords'][0])[::-1]:
+            if rsqE['masked_covFrac'] >= 0.7: continue #skip if masked
+            if rsqE['len'] < 1000: continue
+            if rsqE['rname'] == 'mitochondrion_genome' and post_mito == None and (prev_rsqE == None or prev_rsqE['rname'] != 'mitochondrion_genome'):
+                post_mito = prev_rsqE
+            prev_rsqE=rsqE
+        #/
+        # Find reads spanning mito + anchor
+        mito_start = mito_rsqEs[0]['qcoords'][0]
+        mito_end = mito_rsqEs[-1]['qcoords'][-1]
+        
+        reads_spanning = get_qcoords_rAVAsupp(qname,[mito_start-margin_add1,mito_end+margin_add1])
+        
+        reads_noConflict = set()
+        for read,status in reads_spanning.items():
+            if any(status):
+                reads_noConflict.add(read)
+        
+        qname_loci = None
+        if post_mito and post_mito['rname'] in chroms:
+            qname_loci = post_mito['rname']
+        elif pre_mito and pre_mito['rname'] in chroms:
+            qname_loci = pre_mito['rname']
+        #/
+        # Find reads spanning either anchor
+        reads_anchor1_pre = get_qcoords_rAVAsupp(qname,[mito_start-margin_add2,mito_start+margin_add2])
+        reads_anchor1 = set()
+        for read,status in reads_anchor1_pre.items():
+            if any(status):
+                reads_anchor1.add(read)
+        reads_anchor2_pre = get_qcoords_rAVAsupp(qname,[mito_end-margin_add2,mito_end+margin_add2])
+        reads_anchor2 = set()
+        for read,status in reads_anchor2_pre.items():
+            if any(status):
+                reads_anchor2.add(read)
+        #/
+        
+        # Calc stats about rearrangement haplotype numbers & parse reads
+        rearrs_copynumbers = []
+        genes_hit = {}
+        for rsqE in sorted(qname_rsqRanges[qname],key=lambda x: x['qcoords'][0]):
+            if rsqE['len'] < 1000: continue
+            rAVA_supp = get_qcoords_rAVAsupp(qname,[rsqE['qcoords'][0]-1000,rsqE['qcoords'][0]+1000])
+            
+            haplotype_num = round(len(rAVA_supp)/hapE)
+            if rsqE['masked_covFrac'] > 0.7:
+                rearrs_copynumbers.append([rsqE['qcoords'],rsqE['rname'],haplotype_num,sorted(rsqE['maskClassis_numBPs'],key=lambda x: x[1], reverse=True)[0]])
+            else:
+                rearrs_copynumbers.append([rsqE['qcoords'],rsqE['rname'],haplotype_num])
+            #/
+            # Parse involved genes
+            if rsqE['masked_covFrac'] < 0.7:
+                for oS,idx,oE in rangeOverlaps_lookup(rsqE['rcoords'],GTF_idx_map_ROMD,1000,map_lookup_key=rsqE['rname']):
+                    gtf = GTF_idx_map[idx]
+                    if gtf['type'] == 'gene':
+                        genes_hit[gtf['gene_id']] = HOLDER(ref_seqs[gtf['rname']][gtf['rcoords'][0]:gtf['rcoords'][-1]])
+            #/
+        # Save
+        init(loci_qnames_data,qname_loci,{})
+        loci_qnames_data[qname_loci][qname] = {'oSpan':reads_noConflict,'span1':reads_anchor1,'span2':reads_anchor2,
+                        'rearrs_copynumbers':rearrs_copynumbers,'genes_hit':genes_hit}
+        #/
+    #/
+    
+    # For each loci, dump the read with most oReads spanning mito insertion
+    if 0:
+        # In output directories, align genes & reads to "ref". Import alignments and .bed file to IGV to visualize
+        # -Other reads mapping onto the read used in call
+        # -rsqE blocks on read with information: Chromosome, haplotype number (copy-number) and if repetitive the top repeat
+        tmp_out = MS_output + '/' + 'mito_insertions'
+        mkdir(tmp_out)
+        for loci,qnames_data in loci_qnames_data.items():
+            if loci == None: loci = 'None'
+            if '63d7681f-d9cc-4e8f-93c3-51fe0edb2fbd' in qnames_data: del qnames_data['63d7681f-d9cc-4e8f-93c3-51fe0edb2fbd']
+            tmp_out2 = tmp_out+'/'+loci
+            mkdir(tmp_out2)
+            best_qname = sorted(qnames_data.items(),key=lambda x: len(x[1]['oSpan']),reverse=True)[0][0]
+            
+            qname = best_qname
+            qname_data = qnames_data[qname]
+            
+            # dump "ref"
+            with open(tmp_out2+'/ref.fa','w') as nf:
+                nf.write('>'+qname+'\n'+read_seqs[qname]+'\n')
+            #/
+            # dump reads
+            with open(tmp_out2+'/reads.fa','w') as nf:
+                for oread in qname_data['oSpan'].union(qname_data['span1']).union(qname_data['span2']):
+                    nf.write('>'+oread+'\n'+read_seqs[oread]+'\n')
+            #/
+            # dump genes
+            with open(tmp_out2+'/genes.fa','w') as nf:
+                for gene_id,seq in qname_data['genes_hit'].items():
+                    nf.write('>'+gene_id+'\n'+seq()+'\n')
+            #/
+            # dump regions with haplotype number
+            with open(tmp_out2+'/haplotype_numbers.bed','w') as nf:
+                for region in qname_data['rearrs_copynumbers']:
+                    writeArr = [qname,region[0][0],region[0][-1],'='.join(map(str,region[1:]))]
+                    nf.write('\t'.join(map(str,writeArr))+'\n')
+            #/
+    #/
+    
+###/
+
 ### Calc chrom-densities of stuff, like LTR insertion rate.
 # save INS-associated rBPs as idx-map
 INSBPs_idx_map = {}
@@ -5618,8 +5767,9 @@ CIRCOS_entries = []
 #CIRCOS_entries.append(['8ba72d7b-0656-436d-bc07-1d8c10e09c88']),CIRCOS_entries.append(['e7deb45b-1d36-438a-b969-7b3b0461047f']) # c88=[weird mapper. Might be sequencing fuckup. from 2017.] 47f=[from 2020]
 #CIRCOS_entries.append(['598f04c7-3361-4f3e-86d5-b10e6b72045a','c4981883-4806-46b8-b118-5ae380f30fae'])
 #CIRCOS_entries.append(['8ba72d7b-0656-436d-bc07-1d8c10e09c88'])
-CIRCOS_entries.append(['234040fe-d115-4bd9-ae81-275598af6a1e'])
-#circosPlot(CIRCOS_entries)
+#CIRCOS_entries.append(['234040fe-d115-4bd9-ae81-275598af6a1e'])
+CIRCOS_entries.append(['7f6aa397-4cc2-4c5a-9c0f-fa43bdf49cc7'])
+circosPlot(CIRCOS_entries)
 def circosPlot(CIRCOS_entries,qonly=False,cleanPlot=False):
     # Check if input is single read, then convert to arr 
     if type(CIRCOS_entries) == str:                 CIRCOS_entries = [[CIRCOS_entries]]
@@ -6056,4 +6206,76 @@ def circosPlot(CIRCOS_entries,qonly=False,cleanPlot=False):
         
         # Call plot
         plt.show()
+###/
+
+### Check if transposons exist at DUP sites
+hits = {'yes':0,'no':0,'NA':0}
+DCros_hits = {'yes':set(),'no':set()}
+for qname,rsqEs in qname_rsqRanges.items():
+    # Fetch dup rsqEs
+    DUP_rsqEs = []
+    for rsqE in rsqEs:
+        if 'memberOfDUPs' in rsqE:
+            DUP_rsqEs.append(rsqE)
+    if not DUP_rsqEs: continue
+    #/
+    # Get qspan of DUPs
+    DUP_rsqE_qstart = sorted(DUP_rsqEs,key=lambda x: x['qcoords'][0])[0]
+    DUP_rsqE_qend = sorted(DUP_rsqEs,key=lambda x: x['qcoords'][-1],reverse=True)[0]
+    #/
+    ## Check if repeat at DUP start/end (pre-check so dup rsqEs do not extend and are also anchors [then we know its not a TE insert])
+    hitRepeat = [] # None = not analyzed, False = no repeat, True = repeat.
+    DCros_hit = set()
+    # start
+    skip_qStart = []
+    for oS,idx,oE in rangeOverlaps_lookup(DUP_rsqE_qstart['rcoords'],DCro_idx_map_ROMD,1000,map_lookup_key=DUP_rsqE_qstart['rname']):
+        DCro = DCro_idx_map[idx]
+        # check if dup rsqE is fully contained in DCro (then we keep it)
+        if getRangeOvlp(DCro['rcoords'],DUP_rsqE_qstart['rcoords']) >= (DUP_rsqE_qstart['rcoords'][-1]-DUP_rsqE_qstart['rcoords'][0]):
+            skip_qStart.append(False)
+            DCros_hit.add(idx)
+        else:
+            skip_qStart.append(True)
+    if not any(skip_qStart):
+        DUP_qstart = DUP_rsqE_qstart['qcoords'][0]
+        if DUP_qstart > 5000:
+            DUP_qstart_content = parse_qspanContent(qname,[DUP_qstart-5000,DUP_qstart])
+            if DUP_qstart_content[0] and max(DUP_qstart_content[1].values()) >= 1000:
+                hitRepeat.append(True)
+            else:
+                hitRepeat.append(False)
+    #/
+    # end
+    qlen = DUP_rsqEs[0]['read_len']
+    skip_qEnd = []
+    for oS,idx,oE in rangeOverlaps_lookup(DUP_rsqE_qend['rcoords'],DCro_idx_map_ROMD,1000,map_lookup_key=DUP_rsqE_qend['rname']):
+        DCro = DCro_idx_map[idx]
+        # check if dup rsqE is fully contained in DCro (then we keep it)
+        if getRangeOvlp(DCro['rcoords'],DUP_rsqE_qend['rcoords']) >= (DUP_rsqE_qend['rcoords'][-1]-DUP_rsqE_qend['rcoords'][0]):
+            skip_qEnd.append(False)
+            DCros_hit.add(idx)
+        else:
+            skip_qEnd.append(True)
+    if not any(skip_qStart):
+        DUP_qend = DUP_rsqE_qstart['qcoords'][-1]
+        if qlen - DUP_qend > 5000:
+            DUP_qend_content = parse_qspanContent(qname,[DUP_qend,DUP_qend+5000])
+            if DUP_qend_content[0] and max(DUP_qend_content[1].values()) >= 1000:
+                hitRepeat.append(True)
+            else:
+                hitRepeat.append(False)
+    #/
+    # Check if we had any hits to repeat
+    if not hitRepeat:
+        hits['NA'] += 1
+    elif any(hitRepeat):
+        hits['yes'] += 1
+        DCros_hits['yes'].update(DCros_hit)
+    else:
+        hits['no'] += 1
+        DCros_hits['no'].update(DCros_hit)
+    #/
+    ##/
+for i,j in DCros_hits.items():
+    print(i,len(j))
 ###/
